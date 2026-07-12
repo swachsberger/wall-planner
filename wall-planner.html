@@ -252,9 +252,14 @@ canvas.hover-frame { cursor: grab; }
         <button class="preset-btn" data-w="16" data-h="20">16×20</button>
       </div>
       <div class="row">
-        <input type="number" id="cust-w" min="1" max="240" placeholder="W">
+        <input type="number" id="cust-w" min="0.0625" max="240" step="0.0625" placeholder="W">
         <span class="dim-lbl">×</span>
-        <input type="number" id="cust-h" min="1" max="240" placeholder="H">
+        <input type="number" id="cust-h" min="0.0625" max="240" step="0.0625" placeholder="H">
+        <span class="dim-lbl">in</span>
+      </div>
+      <div class="row">
+        <span class="dim-lbl">Frame width</span>
+        <input type="number" id="cust-border" min="0" max="12" step="0.0625" value="1">
         <span class="dim-lbl">in</span>
       </div>
       <div class="orient-row">
@@ -299,6 +304,7 @@ canvas.hover-frame { cursor: grab; }
 const RULER_SZ  = 38;   // px (logical) ruler thickness
 const WALL_PAD  = 14;   // px gap between ruler and wall edges
 const GUIDE_TOL = 4;    // px alignment guide tolerance
+const SNAP_TOL  = 7;    // px soft-snap pull distance
 const ARROW_SZ  = 5;    // px for gap annotation arrows
 
 // ── State ──────────────────────────────────────────────────────────────────────
@@ -426,6 +432,19 @@ function fmtIn(total) {
   return out + '"';
 }
 
+// Inches to nearest 1/16 as a mixed number (no feet), e.g. 8.0625 -> "8 1/16"
+function fmtInchFrac(inches) {
+  const s16 = Math.round(Math.abs(inches) * 16);
+  const whole = Math.floor(s16 / 16);
+  const frac = s16 % 16;
+  function gcd(a, b) { return b ? gcd(b, a % b) : a; }
+  if (frac === 0) return String(whole);
+  const g = gcd(frac, 16);
+  return (whole > 0 ? whole + ' ' : '') + (frac / g) + '/' + (16 / g);
+}
+// Round an inch value to the nearest 1/16
+function round16(v) { return Math.round(v * 16) / 16; }
+
 // ── Gap adjacency ──────────────────────────────────────────────────────────────
 function findAdjacent() {
   const H = [], V = [];
@@ -454,6 +473,35 @@ function findAdjacent() {
     }
   }
   return { H, V };
+}
+
+// ── Soft snap ──────────────────────────────────────────────────────────────────
+// Pull the dragged frame's edges/centers to nearby frame edges/centers and wall
+// edges/center when within SNAP_TOL. Returns snapped {x, y} in wall inches.
+function applySnap(f, nx, ny) {
+  const tolIn = SNAP_TOL / scale;
+  const xFeatures = [nx, nx + f.w / 2, nx + f.w];           // left, centerX, right
+  const yFeatures = [ny, ny + f.h / 2, ny + f.h];           // top, centerY, bottom
+  const xTargets = [0, wall.w / 2, wall.w];                 // wall left/center/right
+  const yTargets = [0, wall.h / 2, wall.h];                 // wall top/center/bottom
+  for (const o of frames) {
+    if (o.id === f.id) continue;
+    xTargets.push(o.x, o.x + o.w / 2, o.x + o.w);
+    yTargets.push(o.y, o.y + o.h / 2, o.y + o.h);
+  }
+  let bestX = tolIn, sx = nx;
+  for (const feat of xFeatures)
+    for (const t of xTargets) {
+      const d = Math.abs(feat - t);
+      if (d < bestX) { bestX = d; sx = nx + (t - feat); }
+    }
+  let bestY = tolIn, sy = ny;
+  for (const feat of yFeatures)
+    for (const t of yTargets) {
+      const d = Math.abs(feat - t);
+      if (d < bestY) { bestY = d; sy = ny + (t - feat); }
+    }
+  return { x: sx, y: sy };
 }
 
 // ── Alignment guides ───────────────────────────────────────────────────────────
@@ -603,32 +651,58 @@ function drawFrames() {
     const pw = f.w * scale, ph = f.h * scale;
     if (pw < 1 || ph < 1) continue;
 
+    // Molding (frame width) band, drawn inward; opening = footprint minus border
+    const bw = Math.max(0, Math.min((f.border || 0) * scale, Math.min(pw, ph) / 2 - 1));
+    const ox = px + bw, oy = py + bw, ow = pw - bw*2, oh = ph - bw*2;
+
     ctx.save();
     ctx.beginPath();
     ctx.rect(px, py, pw, ph);
     ctx.clip();
 
-    if (f.img) {
-      const iw = f.img.naturalWidth, ih = f.img.naturalHeight;
-      const r  = Math.max(pw / iw, ph / ih);
-      const dw = iw * r, dh = ih * r;
-      ctx.drawImage(f.img, px + (pw - dw)/2, py + (ph - dh)/2, dw, dh);
-    } else {
-      ctx.fillStyle = isDragging ? '#e6e1d8' : '#ebe6dd';
+    // Frame molding fills the whole footprint (covered by the opening if no border)
+    if (bw > 0) {
+      ctx.fillStyle = isDragging ? '#b9b0a1' : '#c3b8a7';
       ctx.fillRect(px, py, pw, ph);
-      // Mat inner line
-      const mat = Math.min(pw, ph) * .1;
-      ctx.strokeStyle = '#d0c9be';
-      ctx.lineWidth = .8;
-      ctx.strokeRect(px + mat, py + mat, pw - mat*2, ph - mat*2);
-      // Label
-      if (pw > 28 && ph > 18) {
-        const fs = Math.min(12, Math.max(8, Math.min(pw, ph) * .15));
-        ctx.font = `${fs}px -apple-system, sans-serif`;
-        ctx.fillStyle = '#aaa';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(f.label, px + pw/2, py + ph/2);
+    }
+
+    if (ow > 0 && oh > 0) {
+      // Opening background (mat)
+      ctx.fillStyle = isDragging ? '#e6e1d8' : '#ebe6dd';
+      ctx.fillRect(ox, oy, ow, oh);
+
+      if (f.img) {
+        // Fit (contain) the photo entirely within the opening
+        const iw = f.img.naturalWidth, ih = f.img.naturalHeight;
+        const r  = Math.min(ow / iw, oh / ih);
+        const dw = iw * r, dh = ih * r;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(ox, oy, ow, oh);
+        ctx.clip();
+        ctx.drawImage(f.img, ox + (ow - dw)/2, oy + (oh - dh)/2, dw, dh);
+        ctx.restore();
+      } else {
+        // Mat inner line
+        const mat = Math.min(ow, oh) * .08;
+        ctx.strokeStyle = '#d0c9be';
+        ctx.lineWidth = .8;
+        ctx.strokeRect(ox + mat, oy + mat, ow - mat*2, oh - mat*2);
+        // Label
+        if (ow > 28 && oh > 18) {
+          const fs = Math.min(12, Math.max(8, Math.min(ow, oh) * .15));
+          ctx.font = `${fs}px -apple-system, sans-serif`;
+          ctx.fillStyle = '#aaa';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(f.label, ox + ow/2, oy + oh/2);
+        }
+      }
+      // Thin line between molding and opening
+      if (bw > 0) {
+        ctx.strokeStyle = 'rgba(0,0,0,.25)';
+        ctx.lineWidth = .8;
+        ctx.strokeRect(ox + .4, oy + .4, ow - .8, oh - .8);
       }
     }
     ctx.restore();
@@ -875,7 +949,10 @@ canvasEl.addEventListener('mousemove', e => {
   let ny = (pos.y - drag.offY - wpx.y) / scale;
   nx = Math.max(0, Math.min(wall.w - f.w, nx));
   ny = Math.max(0, Math.min(wall.h - f.h, ny));
-  f.x = nx; f.y = ny;
+  // Soft snap to edges / centers, then re-clamp inside the wall
+  const snapped = applySnap(f, nx, ny);
+  f.x = Math.max(0, Math.min(wall.w - f.w, snapped.x));
+  f.y = Math.max(0, Math.min(wall.h - f.h, snapped.y));
 
   computeGuides(f);
   draw();
@@ -917,7 +994,9 @@ function rebuildList() {
 
     const lbl = document.createElement('span');
     lbl.className = 'fi-label';
-    lbl.textContent = f.label;
+    lbl.textContent = f.border > 0
+      ? `${f.label} · ${fmtInchFrac(f.border)}" frame`
+      : f.label;
 
     const camBtn = document.createElement('button');
     camBtn.title = 'Add photo';
@@ -943,7 +1022,13 @@ function rebuildList() {
 }
 
 // ── Frame size controls ────────────────────────────────────────────────────────
-let selW = 8, selH = 10, isPortrait = true;
+let selW = 8, selH = 10, isPortrait = true, selBorder = 1;
+
+// Frame width (molding) — blank/invalid keeps the last value in use
+document.getElementById('cust-border').addEventListener('input', e => {
+  const v = parseFloat(e.target.value);
+  if (!isNaN(v) && v >= 0) selBorder = v;
+});
 
 document.querySelectorAll('.preset-btn').forEach(btn => {
   if (btn.dataset.w === '8') btn.classList.add('sel'); // default 8×10
@@ -982,12 +1067,14 @@ document.getElementById('add-btn').addEventListener('click', () => {
   // Portrait = taller than wide; landscape = wider than tall
   if (isPortrait) { fw = Math.min(selW, selH); fh = Math.max(selW, selH); }
   else            { fw = Math.max(selW, selH); fh = Math.min(selW, selH); }
+  fw = round16(fw); fh = round16(fh);
   if (fw <= 0 || fh <= 0) return;
+  const border = round16(Math.max(0, selBorder));
   // Place at center, clamped
   const x = Math.max(0, Math.min(wall.w - fw, (wall.w - fw) / 2));
   const y = Math.max(0, Math.min(wall.h - fh, (wall.h - fh) / 2));
-  const label = fw + '×' + fh + '"';
-  frames.push({ id: nextId++, x, y, w: fw, h: fh, label, img: null, overlapping: false });
+  const label = fmtInchFrac(fw) + '×' + fmtInchFrac(fh) + '"';
+  frames.push({ id: nextId++, x, y, w: fw, h: fh, border, label, img: null, overlapping: false });
   checkOverlaps();
   pushHistory();
   rebuildList();
@@ -1073,7 +1160,7 @@ function serializeState() {
   return {
     wall: { ...wall },
     frames: frames.map(f => ({
-      x: f.x, y: f.y, w: f.w, h: f.h, label: f.label,
+      x: f.x, y: f.y, w: f.w, h: f.h, border: f.border || 0, label: f.label,
       imgSrc: f.img ? f.img.src : null,
     })),
   };
@@ -1116,7 +1203,7 @@ function loadVersion(ver) {
   document.getElementById('wh-in').value = wall.h % 12;
 
   frames = s.frames.map(f => {
-    const nf = { id: nextId++, x: f.x, y: f.y, w: f.w, h: f.h, label: f.label, img: null, overlapping: false };
+    const nf = { id: nextId++, x: f.x, y: f.y, w: f.w, h: f.h, border: f.border || 0, label: f.label, img: null, overlapping: false };
     if (f.imgSrc) {
       const img = new Image();
       img.onload = () => { nf.img = img; draw(); };
